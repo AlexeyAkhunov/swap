@@ -4,19 +4,19 @@ contract ChannelBook {
 
     struct Registration {
         uint slot;              // Slot in the bitmap for this registration
-    	uint start_tick;        // Publication tick from which this registration is valid
-    	uint end_tick;          // Publication tick from which this registration is not valid anymore
-    	bool deposit_withdrawn; // Set to true when registration deposit is withdrawn
+        uint start_tick;        // Publication tick from which this registration is valid
+        uint end_tick;          // Publication tick from which this registration is not valid anymore
+        bool deposit_withdrawn; // Set to true when registration deposit is withdrawn
     }
 
-	mapping (address => Registration[]) members;
+    mapping (address => Registration[]) members;
 
-	mapping (uint => address[]) registration_expiry;
+    mapping (uint => address[]) registration_expiry;
 
     /* Number of members registered (including the ones that have been deleted since) */
-	uint memberSlotMax;
+    uint memberSlotMax;
 
-	uint[] memberSlotFreeList;
+    uint[] memberSlotFreeList;
 
     uint constant REGISTRATION_DEPOSIT = 1 ether;   // Each registration holds deposit
     uint constant REGISTRATION_DURATION = 100;      // How many publications a registration is valid for
@@ -27,41 +27,41 @@ contract ChannelBook {
         require(msg.value == REGISTRATION_DEPOSIT);
         uint len = members[msg.sender].length;
         uint currentTick = publications.length;
-    	require(len == 0 || members[msg.sender][len-1].end_tick <= currentTick); // Cannot register until the current registration expires
-    	// Check the free list first
-    	uint slot;
-    	if (memberSlotFreeList.length == 0) {
-    		memberSlotMax += 1;
-    		slot = memberSlotMax;
-    	} else {
-    		slot = memberSlotFreeList[memberSlotFreeList.length-1];
-    		memberSlotFreeList.length -= 1;
-    	}
-    	uint endTick = currentTick + REGISTRATION_DURATION;
-    	require(registration_expiry[endTick].length < MAX_REGISTRATIONS_PER_TICK);
-    	registration_expiry[endTick].push(msg.sender);
-    	members[msg.sender].push(Registration(slot, currentTick, endTick, false /* deposit_withdrawn */));
+        require(len == 0 || members[msg.sender][len-1].end_tick <= currentTick); // Cannot register until the current registration expires
+        // Check the free list first
+        uint slot;
+        if (memberSlotFreeList.length == 0) {
+            memberSlotMax += 1;
+            slot = memberSlotMax;
+        } else {
+            slot = memberSlotFreeList[memberSlotFreeList.length-1];
+            memberSlotFreeList.length -= 1;
+        }
+        uint endTick = currentTick + REGISTRATION_DURATION;
+        require(registration_expiry[endTick].length < MAX_REGISTRATIONS_PER_TICK);
+        registration_expiry[endTick].push(msg.sender);
+        members[msg.sender].push(Registration(slot, currentTick, endTick, false /* deposit_withdrawn */));
     }
 
     /* Maintenance function that is called to ensure that expired registrations are returned to the free list */
     function expire_registrations() private {
-    	uint currentTick = publications.length;
-    	uint len = registration_expiry[currentTick].length;
-    	if (len > 0) {
-    		for(uint i = 0; i < len; i++) {
-    		    address member = registration_expiry[currentTick][i];
-    		    uint member_len = members[member].length;
-    			memberSlotFreeList.push(members[member][member_len - 1].slot);
-    		}
-    		delete registration_expiry[currentTick];
-    	}
+        uint currentTick = publications.length;
+        uint len = registration_expiry[currentTick].length;
+        if (len > 0) {
+            for(uint i = 0; i < len; i++) {
+                address member = registration_expiry[currentTick][i];
+                uint member_len = members[member].length;
+                memberSlotFreeList.push(members[member][member_len - 1].slot);
+            }
+            delete registration_expiry[currentTick];
+        }
     }
 
     function withdraw_registration_deposit(uint registration_index) public {
-    	require(registration_index < members[msg.sender].length);
-    	require(!members[msg.sender][registration_index].deposit_withdrawn);
-    	members[msg.sender][registration_index].deposit_withdrawn = true;
-    	msg.sender.transfer(REGISTRATION_DEPOSIT);
+        require(registration_index < members[msg.sender].length);
+        require(!members[msg.sender][registration_index].deposit_withdrawn);
+        members[msg.sender][registration_index].deposit_withdrawn = true;
+        msg.sender.transfer(REGISTRATION_DEPOSIT);
     }
 
     /* =================================================================================================================== */
@@ -69,41 +69,51 @@ contract ChannelBook {
     uint constant PUBLISH_DEPOSIT = 1 ether;   // Size of each publication deposit
     /* Deposit required to block withdrawal of the publishing deposit */
     uint constant BLOCKING_DEPOSIT = 10 finney;
-    uint constant PUBLISH_DEPOSITS_HELD = 50;     // The contract will hold up to 50 deposits at any given time
-    uint constant BLOCKING_DEPOSIT_DURATION = 50; // Number of publication ticks before blocking deposit can be withdrawn
+    uint constant PUBLISH_DEPOSIT_DURATION = 3 days;     // The contract will hold publishing deposits for 3 days
+    uint constant BLOCKING_DEPOSIT_DURATION = 1 days;     // How long a blocking deposit is held
     uint constant BLOCK_DEPOSIT = 10 finney;
 
     struct Block {
-    	uint deposit_withdraw_tick;   // Publication tick on which the withdrawal of the blocking deposit is first allowed
-    	bool deposit_withdrawn;       // Deposit withdrawn by the blocker or by the publisher
-    	bool active;                  // True if the block is active (created by not sucessfully contested)
+        bool deposit_returned;        // Deposit withdrawn by the blocker or by the publisher
+        bool active;                  // True if the block is active (created by not sucessfully contested)
     }
 
     struct Publication {
-    	bytes32 root_hash;                 // Hash of the trie for this publication
-    	uint256[] contributions;           // Bitmap of contributions
-    	address publisher;                 // Address who published it and paid deposit
-    	bool deposit_withdrawn;
-    	uint blockCount;                   // Number of blocks created against this publication
-    	mapping (address => Block) blocks; // Blocks created against this publications by contributors
+        bytes32 root_hash;                 // Hash of the trie for this publication
+        uint256[] contributions;           // Bitmap of contributions
+        address publisher;                 // Address who published it and paid deposit
+        uint deposit_return_time;          // Time after which the publishing deposit can be returned
+        bool deposit_returned;
+        uint blockCount;
+        mapping (address => Block) blocks; // Blocks created against this publications by contributors
     }
 
     Publication[] public publications;
 
+    mapping(address => uint) deposits_returned;  // Deposits returned (but not withdrawn)
+
     function publish(bytes32 root_hash, uint256[] contributions) public payable {
-    	// Deposit amount needs to be exact
-    	require(msg.value == PUBLISH_DEPOSIT);
-    	publications.push(Publication(root_hash, contributions, msg.sender, false, 0));
-    	expire_registrations();
+        // Deposit amount needs to be exact
+        require(msg.value == PUBLISH_DEPOSIT);
+        publications.push(Publication(root_hash, contributions, msg.sender, now + PUBLISH_DEPOSIT_DURATION, false, 0));
+        expire_registrations();
     }
 
-    function withdraw_publishing_deposit(uint index) public {
-    	require(index < publications.length);
-    	require(publications.length - index > PUBLISH_DEPOSITS_HELD);
-    	require(!publications[index].deposit_withdrawn);
-    	require(publications[index].blockCount == 0);    // No outstanding blocks
-    	publications[index].deposit_withdrawn = true;
-    	publications[index].publisher.transfer(PUBLISH_DEPOSIT);
+    function return_publish_deposits(uint startTick, uint endTick) public {
+        for(uint i=startTick; i < endTick && now < publications[i].deposit_return_time; i++) {
+            if (publications[i].blockCount == 0) {
+                publications[i].deposit_returned = true;
+                deposits_returned[publications[i].publisher] += PUBLISH_DEPOSIT;
+            }
+        }
+    }
+
+    function withdraw_deposit() public {
+        uint to_return = deposits_returned[msg.sender];
+        if (to_return > 0) {
+            deposits_returned[msg.sender] = 0;
+            msg.sender.transfer(to_return);
+        }
     }
 
     /* Any contributor to a publication can use this function to attempt to block the
@@ -115,45 +125,50 @@ contract ChannelBook {
     function block_withdraw(uint tick, uint registration_index) public payable {
         require(msg.value == BLOCKING_DEPOSIT);
         uint currentTick = publications.length;
-    	require(tick < currentTick);
-    	require(!publications[tick].deposit_withdrawn);
-    	require(!publications[tick].blocks[msg.sender].active);
-    	require(registration_index < members[msg.sender].length);
-    	require(members[msg.sender][registration_index].start_tick <= tick);
-    	require(members[msg.sender][registration_index].end_tick > tick);
-    	uint member_slot = members[msg.sender][registration_index].slot;
-    	// Divide by 256, because every bit in the contributions words
-    	// correspond to one member
-    	uint contributions_word_index = member_slot >> 8;
-    	uint contributions_mask = uint256(1) << (member_slot & 0xFF);
-    	require(publications[tick].contributions[contributions_word_index] & contributions_mask != 0);
-    	publications[tick].blockCount++;
-    	publications[tick].blocks[msg.sender] = Block(currentTick + BLOCKING_DEPOSIT_DURATION, false /* deposit_withdrawn */, true /* active */);
+        require(tick < currentTick);
+        require(!publications[tick].deposit_returned);
+        require(now < publications[tick].deposit_return_time);  // Too late to block
+        require(!publications[tick].blocks[msg.sender].active);
+        require(registration_index < members[msg.sender].length);
+        require(members[msg.sender][registration_index].start_tick <= tick);
+        require(members[msg.sender][registration_index].end_tick > tick);
+        uint member_slot = members[msg.sender][registration_index].slot;
+        // Divide by 256, because every bit in the contributions words
+        // correspond to one member
+        uint contributions_word_index = member_slot >> 8;
+        uint contributions_mask = uint256(1) << (member_slot & 0xFF);
+        require(publications[tick].contributions[contributions_word_index] & contributions_mask != 0);
+        publications[tick].contributions[contributions_word_index] &= ~contributions_mask;
+        publications[tick].blockCount++;
+        publications[tick].blocks[msg.sender] = Block(
+            false /* deposit_returned */,
+            true /* active */
+            );
      }
 
      /* Publisher (or anyone else on behalf of publisher) uses this function to remove the block
         placed by a contributor */
      function unblock_withdraw(uint tick, address blocker, uint8 v, bytes32 r, bytes32 s) public {
-     	require(tick < publications.length);
-     	require(publications[tick].blocks[blocker].active);
-     	require(blocker == ecrecover(publications[tick].root_hash, v, r, s));
-     	// Remove the block and claim the blocker's deposit
-     	publications[tick].blocks[blocker].active = false;
-     	publications[tick].blockCount--;
-     	if (!publications[tick].blocks[blocker].deposit_withdrawn) {
-     	    publications[tick].blocks[blocker].deposit_withdrawn = true;
-     		publications[tick].publisher.transfer(BLOCKING_DEPOSIT);
-     	}
+        require(tick < publications.length);
+        require(publications[tick].blocks[blocker].active);
+        require(blocker == ecrecover(publications[tick].root_hash, v, r, s));
+        // Remove the block and claim the blocker's deposit
+        publications[tick].blockCount--;
+        publications[tick].blocks[blocker].active = false;
+        if (!publications[tick].blocks[blocker].deposit_returned) {
+            publications[tick].blocks[blocker].deposit_returned = true;
+            deposits_returned[publications[tick].publisher] += BLOCKING_DEPOSIT;
+        }
      }
 
-     function withdraw_blocking_deposit(uint tick) public {
-     	uint currentTick = publications.length;
-     	require(tick < currentTick);
-     	require(publications[tick].blocks[msg.sender].active);
-     	require(!publications[tick].blocks[msg.sender].deposit_withdrawn);
-     	require(publications[tick].blocks[msg.sender].deposit_withdraw_tick <= currentTick);
-     	publications[tick].blocks[msg.sender].deposit_withdrawn = true;
-     	msg.sender.transfer(BLOCKING_DEPOSIT);
+     function return_blocking_deposit(uint tick) public {
+        uint currentTick = publications.length;
+        require(tick < currentTick);
+        require(publications[tick].blocks[msg.sender].active);
+        require(!publications[tick].blocks[msg.sender].deposit_returned);
+        require(now >= publications[tick].deposit_return_time + BLOCKING_DEPOSIT_DURATION);
+        publications[tick].blocks[msg.sender].deposit_returned = true;
+        deposits_returned[msg.sender] += BLOCKING_DEPOSIT;
      }
 
 
