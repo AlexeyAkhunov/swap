@@ -6,7 +6,6 @@ contract ChannelBook {
         uint slot;              // Slot in the bitmap for this registration
         uint start_tick;        // Publication tick from which this registration is valid
         uint end_tick;          // Publication tick from which this registration is not valid anymore
-        bool deposit_withdrawn; // Set to true when registration deposit is withdrawn
     }
 
     mapping (address => Registration[]) members;
@@ -22,9 +21,23 @@ contract ChannelBook {
     uint constant REGISTRATION_DURATION = 100;      // How many publications a registration is valid for
     uint constant MAX_REGISTRATIONS_PER_TICK = 100; // To prevent edge cases in loops
 
+    
+    function take_payment(uint amount) private {
+        // Can the payment be satisfied by the returned deposits?
+        uint from_returned = deposits_returned[msg.sender];
+        if (from_returned > amount) {
+            from_returned = amount;
+        }
+        require(msg.value + from_returned >= amount);
+        uint to_return = msg.value + from_returned - amount;
+        if (to_return > 0) {
+            deposits_returned[msg.sender] += to_return; // Excess can be withdrawn at any time
+        }
+    }
+
     /* msg.sender registers itself as member. Returns the slot in the bitmap that the member will occupy */
     function register_as_member() public payable {
-        require(msg.value == REGISTRATION_DEPOSIT);
+        take_payment(REGISTRATION_DEPOSIT);
         uint len = members[msg.sender].length;
         uint currentTick = publications.length;
         require(len == 0 || members[msg.sender][len-1].end_tick <= currentTick); // Cannot register until the current registration expires
@@ -40,7 +53,7 @@ contract ChannelBook {
         uint endTick = currentTick + REGISTRATION_DURATION;
         require(registration_expiry[endTick].length < MAX_REGISTRATIONS_PER_TICK);
         registration_expiry[endTick].push(msg.sender);
-        members[msg.sender].push(Registration(slot, currentTick, endTick, false /* deposit_withdrawn */));
+        members[msg.sender].push(Registration(slot, currentTick, endTick));
     }
 
     /* Maintenance function that is called to ensure that expired registrations are returned to the free list */
@@ -50,18 +63,12 @@ contract ChannelBook {
         if (len > 0) {
             for(uint i = 0; i < len; i++) {
                 address member = registration_expiry[currentTick][i];
+                deposits_returned[member] += REGISTRATION_DEPOSIT;
                 uint member_len = members[member].length;
                 memberSlotFreeList.push(members[member][member_len - 1].slot);
             }
             delete registration_expiry[currentTick];
         }
-    }
-
-    function withdraw_registration_deposit(uint registration_index) public {
-        require(registration_index < members[msg.sender].length);
-        require(!members[msg.sender][registration_index].deposit_withdrawn);
-        members[msg.sender][registration_index].deposit_withdrawn = true;
-        msg.sender.transfer(REGISTRATION_DEPOSIT);
     }
 
     /* =================================================================================================================== */
@@ -90,7 +97,7 @@ contract ChannelBook {
 
     Publication[] public publications;
 
-    mapping(address => uint) deposits_returned;  // Deposits returned (but not withdrawn)
+    mapping(address => uint) public deposits_returned;  // Deposits returned (but not withdrawn)
 
     function publish(bytes32 root_hash, uint256[] contributions) public payable {
         // Deposit amount needs to be exact
@@ -108,11 +115,14 @@ contract ChannelBook {
         }
     }
 
-    function withdraw_deposit() public {
-        uint to_return = deposits_returned[msg.sender];
-        if (to_return > 0) {
-            deposits_returned[msg.sender] = 0;
-            msg.sender.transfer(to_return);
+    function withdraw_deposit(uint amount) public {
+        uint to_withdraw = deposits_returned[msg.sender];
+        if (to_withdraw > amount) {
+            to_withdraw = amount;
+        }
+        if (to_withdraw > 0) {
+            deposits_returned[msg.sender] -= to_withdraw;
+            msg.sender.transfer(to_withdraw);
         }
     }
 
@@ -123,7 +133,7 @@ contract ChannelBook {
        would have been given to the publisher in exchange for the Merkle proof.
        To prevent frivolous blocking, blocking requires a deposit */
     function block_withdraw(uint tick, uint registration_index) public payable {
-        require(msg.value == BLOCKING_DEPOSIT);
+        take_payment(PUBLISH_DEPOSIT);
         uint currentTick = publications.length;
         require(tick < currentTick);
         require(!publications[tick].deposit_returned);
